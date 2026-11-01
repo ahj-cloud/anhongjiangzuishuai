@@ -28,6 +28,7 @@ final class SiteEngine: NSObject, ObservableObject {
 
     private override init() {
         super.init()
+        restoreCorpus()      // 先把上次的片库读回来，搜索联想不用等首页
         _ = webView          // 触发懒加载，开始预热
     }
 
@@ -55,11 +56,8 @@ final class SiteEngine: NSObject, ObservableObject {
             let feed = try await task.value
             lastHome = feed
             homeTask = nil
-            // 把首页所有条目沉成一份本地语料，搜索时先做本地过滤，避免每次都干等远端
-            var seen = Set<String>()
-            corpus = (feed.hero + feed.sections.flatMap { $0.items }).filter {
-                seen.insert($0.id).inserted
-            }
+            // 首页条目沉进本地语料，搜索时先做本地过滤，避免每次都干等远端
+            mergeIntoCorpus(feed.hero + feed.sections.flatMap { $0.items })
             return feed
         } catch {
             homeTask = nil
@@ -70,13 +68,63 @@ final class SiteEngine: NSObject, ObservableObject {
     /// 本地语料库：首页已加载的全部条目，用于搜索时即时出结果
     private var corpus: [MediaItem] = []
 
+    private var corpusFile: URL {
+        let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+        return dir.appendingPathComponent("bpz_corpus.json")
+    }
+
+    /// 落盘，下次启动立刻有联想数据，不用等首页加载完
+    private func persistCorpus() {
+        let slice = Array(corpus.prefix(800))
+        guard let data = try? JSONEncoder().encode(slice) else { return }
+        try? data.write(to: corpusFile, options: .atomic)   // 原子写，避免半截文件
+    }
+
+    private func restoreCorpus() {
+        guard corpus.isEmpty,
+              let data = try? Data(contentsOf: corpusFile),
+              let list = try? JSONDecoder().decode([MediaItem].self, from: data)
+        else { return }
+        corpus = list
+    }
+
+    /// 把新出现的条目并进语料，搜索/浏览越用越全
+    private func mergeIntoCorpus(_ items: [MediaItem]) {
+        guard !items.isEmpty else { return }
+        var added = 0
+        lock.lock()
+        var index = Set(corpus.map { $0.id })
+        for it in items where index.insert(it.id).inserted {
+            corpus.append(it)
+            added += 1
+        }
+        lock.unlock()
+        if added > 0 { persistCorpus() }        // 磁盘写在锁外
+    }
+
     /// 先在本地片库里模糊匹配，命中即为「秒出」结果；远端结果回来后覆盖。
     func localSearch(_ word: String, limit: Int = 40) -> [MediaItem] {
         let w = word.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !w.isEmpty else { return [] }
+
+        lock.lock()
+        let snapshot = corpus
+        lock.unlock()
+
+        if snapshot.isEmpty {
+            restoreCorpus()
+            lock.lock()
+            let again = corpus
+            lock.unlock()
+            return Self.filter(again, by: w, limit: limit)
+        }
+        return Self.filter(snapshot, by: w, limit: limit)
+    }
+
+    private static func filter(_ pool: [MediaItem], by w: String, limit: Int) -> [MediaItem] {
         var exact: [MediaItem] = []
         var fuzzy: [MediaItem] = []
-        for item in corpus {
+        for item in pool {
             let title = item.title.lowercased()
             if title.contains(w) {
                 exact.append(item)
@@ -122,6 +170,7 @@ final class SiteEngine: NSObject, ObservableObject {
         guard !items.isEmpty else { throw SiteError.empty("没有搜到「\(word)」") }
 
         searchCache[word] = (items, Date())
+        mergeIntoCorpus(items)
         if searchCache.count > searchCacheLimit {
             // 超限时按时间淘汰最旧的一批
             let sorted = searchCache.sorted { $0.value.at < $1.value.at }
