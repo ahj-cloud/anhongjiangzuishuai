@@ -31,6 +31,8 @@ targets:
         PRODUCT_NAME: AnHongJiang
         TARGETED_DEVICE_FAMILY: "1"
         ASSETCATALOG_COMPILER_APPICON_NAME: ""
-        SWIFT_OPTIMIZATION_LEVEL: "-Onone"
+        # Xcode 16 默认把主代码放进 AnHongJiang.debug.dylib，主二进制只剩壳。
+        # 自签安装时 rpath 解析不到这个 dylib 会直接闪退，所以必须关掉。
+        ENABLE_DEBUG_DYLIB: NO
         OTHER_LDFLAGS: "-ObjC"
         LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/Frameworks"
