@@ -3,6 +3,8 @@ import SwiftUI
 @MainActor
 final class DetailViewModel: ObservableObject {
     @Published private(set) var state: LoadState<DetailPayload> = .idle
+    /// 详情接口没拿到数据、用列表页已知信息兜底时为 true
+    @Published private(set) var degraded = false
     private let item: MediaItem
 
     init(item: MediaItem) { self.item = item }
@@ -13,9 +15,22 @@ final class DetailViewModel: ObservableObject {
         do {
             let payload = try await SiteEngine.shared.detail(item)
             state = .loaded(payload)
+            degraded = false
         } catch {
-            state = .failed((error as? LocalizedError)?.errorDescription ?? "详情加载失败")
+            // 部分片源的详情路由抓不到数据。这时不弹错误，
+            // 用列表页已有的标题/海报/简介兜底，播放交给内嵌播放页自己处理。
+            state = .loaded(Self.fallback(item))
+            degraded = true
         }
+    }
+
+    private static func fallback(_ item: MediaItem) -> DetailPayload {
+        DetailPayload(
+            item: item,
+            episodes: [Episode(id: "main", name: "正片", url: nil, route: item.detailRoute)],
+            sources: [],
+            related: []
+        )
     }
 }
 
@@ -44,6 +59,7 @@ struct DetailView: View {
                     ErrorStateView(message: msg) { Task { await vm.load(force: true) } }
                         .frame(height: 240)
                 case .loaded(let payload):
+                    if vm.degraded { degradedHint }
                     episodes(payload)
                     related(payload)
                 }
@@ -107,6 +123,21 @@ struct DetailView: View {
             .foregroundStyle(Theme.subtext)
             .padding(.horizontal, 6).padding(.vertical, 2)
             .background(Theme.hairline.opacity(0.6), in: RoundedRectangle(cornerRadius: 4))
+    }
+
+    // MARK: 兜底提示
+
+    private var degradedHint: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "info.circle.fill").font(.system(size: 12))
+            Text("该片源详情未取到，可直接点播放")
+                .font(.system(size: 12))
+            Spacer(minLength: 0)
+        }
+        .foregroundStyle(Theme.subtext)
+        .padding(.horizontal, 12).padding(.vertical, 9)
+        .background(Theme.card, in: RoundedRectangle(cornerRadius: 8))
+        .padding(.horizontal, Theme.pagePadding)
     }
 
     // MARK: 简介
