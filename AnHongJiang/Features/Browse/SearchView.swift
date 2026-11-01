@@ -7,12 +7,21 @@ final class SearchViewModel: ObservableObject {
     @Published private(set) var searching = false
     /// 已有本地结果、远端还在补全时置 true（结果区顶部显示一条细进度条，不遮挡列表）
     @Published private(set) var refining = false
+    /// 输入时的本地联想，纯内存匹配，不发网络
+    @Published private(set) var hints: [MediaItem] = []
 
     private let historyKey = "bpz.search.history"
     private var seq = 0          // 请求序号，防止先发后到覆盖新结果
 
     var recent: [String] {
         UserDefaults.standard.stringArray(forKey: historyKey) ?? []
+    }
+
+    /// 每次输入调用，只查本地语料，保证键入无延迟
+    func updateHints(_ text: String) {
+        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !t.isEmpty else { hints = []; return }
+        hints = Array(SiteEngine.shared.localSearch(t, limit: 6))
     }
 
     func search(_ text: String? = nil) async {
@@ -77,7 +86,7 @@ struct SearchView: View {
             Group {
                 switch vm.state {
                 case .idle:
-                    suggestions
+                    if vm.hints.isEmpty { suggestions } else { hintList }
                 case .loading:
                     LoadingView(text: "AI 正在检索，请稍候")
                 case .failed(let msg):
@@ -97,9 +106,68 @@ struct SearchView: View {
             .searchable(text: $vm.keyword, placement: .navigationBarDrawer(displayMode: .always),
                         prompt: "片名、演员、关键词")
             .onSubmit(of: .search) { Task { await vm.search() } }
+            .onChange(of: vm.keyword) { _, newValue in
+                vm.updateHints(newValue)          // 纯本地匹配，键入不卡
+            }
             .navigationDestination(for: MediaItem.self) { DetailView(item: $0) }
             .sheet(isPresented: $showWeb) {
                 WebFallbackView(path: "/search?q=\(vm.keyword.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? "")")
+            }
+        }
+    }
+
+    /// 输入时的本地联想：点一条直接进详情，不用等远端
+    private var hintList: some View {
+        ScrollView {
+            LazyVStack(spacing: 0) {
+                ForEach(vm.hints) { item in
+                    NavigationLink(value: item) {
+                        HStack(spacing: 12) {
+                            RemoteImage(url: item.posterURL)
+                                .frame(width: 42, height: 60)
+                                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(item.title)
+                                    .font(.system(size: 14, weight: .medium))
+                                    .foregroundStyle(Theme.text)
+                                    .lineLimit(1)
+                                HStack(spacing: 6) {
+                                    if let y = item.year {
+                                        Text(y).font(.system(size: 11)).foregroundStyle(Theme.subtext)
+                                    }
+                                    if let r = item.remark {
+                                        Text(r).font(.system(size: 11)).foregroundStyle(Theme.brand)
+                                    }
+                                }
+                            }
+                            Spacer(minLength: 0)
+                            Image(systemName: "arrow.up.left")
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundStyle(Theme.subtext)
+                        }
+                        .padding(.horizontal, Theme.pagePadding)
+                        .padding(.vertical, 8)
+                    }
+                    .buttonStyle(.plain)
+                    Divider().padding(.leading, Theme.pagePadding + 54)
+                }
+
+                // 本地没有的，交给远端 AI 搜
+                Button {
+                    Task { await vm.search() }
+                } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: "magnifyingglass")
+                            .font(.system(size: 13, weight: .semibold))
+                        Text("在 AI 片库里搜索「\(vm.keyword)」")
+                            .font(.system(size: 13.5))
+                        Spacer(minLength: 0)
+                    }
+                    .foregroundStyle(Theme.brand)
+                    .padding(.horizontal, Theme.pagePadding)
+                    .padding(.vertical, 14)
+                }
+                .buttonStyle(.plain)
             }
         }
     }
