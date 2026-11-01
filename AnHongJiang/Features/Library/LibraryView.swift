@@ -46,7 +46,7 @@ struct LibraryView: View {
                         row("safari", "打开网页版", nil)
                     }
                     NavigationLink { AboutView() } label: {
-                        row("info.circle", "关于安洪江最帅", "1.0.0")
+                        row("info.circle", "关于安宇最帅", "1.0.0")
                     }
                 }
             }
@@ -170,7 +170,7 @@ struct AboutView: View {
                 HStack {
                     Text("应用名称")
                     Spacer()
-                    Text("安洪江最帅").foregroundStyle(Theme.subtext)
+                    Text("安宇最帅").foregroundStyle(Theme.subtext)
                 }
                 HStack {
                     Text("版本")
