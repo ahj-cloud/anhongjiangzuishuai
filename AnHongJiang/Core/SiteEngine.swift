@@ -158,7 +158,8 @@ final class SiteEngine: NSObject, ObservableObject {
 
         // 站点真实搜索路由：/session/new?pending=1&submission=<q>
         // （路由表里没有 /search，按 /search?q= 请求只会 404 后空等超时）
-        let q = word.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? word
+        let sent = Self.normalizeQuery(word)
+        let q = sent.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? sent
         let path = "/session/new?pending=1&submission=\(q)"
 
         let bodies = try await visit(path: path, timeout: 30,
@@ -179,6 +180,23 @@ final class SiteEngine: NSObject, ObservableObject {
             }
         }
         return items
+    }
+
+    /// 「现在就出发第四季」→「现在就出发 第四季」
+    ///
+    /// 站点搜索是 AI 会话，按自然语言切词匹配。季数紧贴在片名后面时，
+    /// 模型容易把整串当成一个片名去找，隔开一位命中率明显更高。
+    static func normalizeQuery(_ raw: String) -> String {
+        var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let r = s.range(of: #"第[0-9一二三四五六七八九十]+[季部集期]"#,
+                              options: .regularExpression),
+              r.lowerBound != s.startIndex else { return s }
+        // 前一位已经是空格或标点就不再插
+        let prev = s[s.index(before: r.lowerBound)]
+        if prev != " " && prev != "·" && prev != "-" {
+            s.insert(" ", at: r.lowerBound)
+        }
+        return s
     }
 
     func detail(_ item: MediaItem) async throws -> DetailPayload {
@@ -349,8 +367,12 @@ final class SiteEngine: NSObject, ObservableObject {
     /// 播放页里 hls.js 拉取的 m3u8/mp4 地址（带 token 的完整 URL）
     private var mediaURLs: [(url: String, at: Date)] = []
     private let maxMedia = 40
-    /// 解析结果缓存：item.id -> m3u8，避免同一集重复解析
-    private var streamCache: [String: String] = [:]
+    /// 解析结果缓存：item.id -> m3u8。m3u8 的 token 有有效期，
+    /// 不能永久缓存，过期后 AVPlayer 会连续 403 卡住。
+    private var streamCache: [String: (url: String, at: Date)] = [:]
+    private let streamCacheTTL: TimeInterval = 900
+    /// 正在解析中的任务，避免同一集被并发解析两次
+    private var streamTasks: [String: Task<String?, Never>] = [:]
 
     private func recordMedia(_ url: String) {
         lock.lock()
@@ -388,8 +410,34 @@ final class SiteEngine: NSObject, ObservableObject {
     func resolveStream(path: String, cacheKey: String,
                        timeout: TimeInterval = 18) async -> String? {
         let key = cacheKey
-        if let cached = streamCache[key], !cached.isEmpty { return cached }
+        if let hit = streamCache[key], !hit.url.isEmpty,
+           Date().timeIntervalSince(hit.at) < streamCacheTTL {
+            return hit.url
+        }
 
+        // 预取和用户点播会同时触发解析，去重：同一个 key 只跑一次。
+        // 否则隐藏 WebView 会被两次导航互相打乱，谁都不出结果。
+        lock.lock()
+        if let running = streamTasks[key] {
+            lock.unlock()
+            return await running.value
+        }
+        let task = Task<String?, Never> { [weak self] in
+            guard let self else { return nil }
+            return await self.doResolveStream(path: path, key: key, timeout: timeout)
+        }
+        streamTasks[key] = task
+        lock.unlock()
+
+        let result = await task.value
+        lock.lock()
+        streamTasks.removeValue(forKey: key)
+        lock.unlock()
+        return result
+    }
+
+    private func doResolveStream(path: String, key: String,
+                                 timeout: TimeInterval) async -> String? {
         let start = Date()
         let soft = await softNavigate(path)
         if !soft {
@@ -403,7 +451,7 @@ final class SiteEngine: NSObject, ObservableObject {
         var rounds = 0
         while Date() < deadline {
             if let s = latestStream(since: start) {
-                streamCache[key] = s
+                streamCache[key] = (s, Date())
                 return s
             }
             rounds += 1
