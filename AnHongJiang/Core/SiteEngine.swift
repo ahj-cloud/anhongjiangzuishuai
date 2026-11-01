@@ -295,6 +295,107 @@ final class SiteEngine: NSObject, ObservableObject {
         lock.unlock()
     }
 
+    // MARK: - 播放地址解析
+
+    /// 播放页里 hls.js 拉取的 m3u8/mp4 地址（带 token 的完整 URL）
+    private var mediaURLs: [(url: String, at: Date)] = []
+    private let maxMedia = 40
+    /// 解析结果缓存：item.id -> m3u8，避免同一集重复解析
+    private var streamCache: [String: String] = [:]
+
+    private func recordMedia(_ url: String) {
+        lock.lock()
+        mediaURLs.append((url, Date()))
+        if mediaURLs.count > maxMedia { mediaURLs.removeFirst(mediaURLs.count - maxMedia) }
+        lock.unlock()
+    }
+
+    private func latestStream(since: Date) -> String? {
+        lock.lock()
+        let list = mediaURLs
+        lock.unlock()
+        let fresh = list.filter { $0.at >= since }
+        // 优先 m3u8，其次 mp4；页面给的可能是相对路径，补成绝对地址
+        if let m3u8 = fresh.last(where: { $0.url.contains(".m3u8") }) {
+            return Self.normalizeURL(m3u8.url)
+        }
+        if let other = fresh.last {
+            return Self.normalizeURL(other.url)
+        }
+        return nil
+    }
+
+    private static func normalizeURL(_ raw: String) -> String {
+        if raw.hasPrefix("//") { return "https:" + raw }
+        if raw.hasPrefix("/") { return SiteConfig.origin + raw }
+        return raw
+    }
+
+    /// 打开播放页，催页面起播，把 hls.js 请求的 m3u8 地址截下来。
+    ///
+    /// 站点的播放地址不是接口直接返回的：先用 playback_source_id 换 token，
+    /// 再由播放器向 provider 取分片，链接只出现在实际请求里。
+    /// 抓到后就能交给 AVPlayer 原生播放，不再需要网页播放器。
+    func resolveStream(path: String, cacheKey: String,
+                       timeout: TimeInterval = 18) async -> String? {
+        let key = cacheKey
+        if let cached = streamCache[key], !cached.isEmpty { return cached }
+
+        let start = Date()
+        let soft = await softNavigate(path)
+        if !soft {
+            await hardLoad(SiteConfig.url(path), timeout: timeout)
+        }
+
+        // 页面要先把播放器挂上去，太早催没用
+        try? await Task.sleep(nanoseconds: 1_200_000_000)
+
+        let deadline = Date().addingTimeInterval(timeout)
+        var rounds = 0
+        while Date() < deadline {
+            if let s = latestStream(since: start) {
+                streamCache[key] = s
+                return s
+            }
+            rounds += 1
+            _ = try? await evaluate(Self.triggerPlayJS)
+            try? await Task.sleep(nanoseconds: 700_000_000)
+            // 每 4 轮补一次整页加载，应对软跳转没触发路由的片子
+            if rounds == 4 && soft {
+                await hardLoad(SiteConfig.url(path), timeout: timeout)
+            }
+        }
+        return nil
+    }
+
+    /// 催页面起播：直接 play 视频元素，不行就点带「播放」字样的按钮
+    private static let triggerPlayJS = """
+    (function(){
+      try {
+        var v = document.querySelector('video');
+        if (v) {
+          v.muted = true;
+          var p = v.play();
+          if (p && p.catch) { p.catch(function(){}); }
+          return 'play';
+        }
+        var sels = ['[aria-label*="播放"]','[title*="播放"]','button','[role="button"]','[class*="play"]'];
+        for (var i=0;i<sels.length;i++){
+          var els = document.querySelectorAll(sels[i]);
+          for (var j=0;j<els.length;j++){
+            var t = (els[j].innerText || '').trim();
+            var a = els[j].getAttribute('aria-label') || '';
+            if (t.indexOf('播放') >= 0 || a.indexOf('播放') >= 0) {
+              els[j].click();
+              return 'click';
+            }
+          }
+        }
+        return 'none';
+      } catch (e) { return 'err'; }
+    })()
+    """
+
     private let lock = NSLock()
 
     // MARK: - WebView 构建
@@ -339,6 +440,23 @@ final class SiteEngine: NSObject, ObservableObject {
         } catch (e) {}
       }
 
+      // 只上报地址、不上报内容：m3u8 是播放列表文本，原生端只需要 URL
+      function postMedia(url) {
+        try {
+          window.webkit.messageHandlers.bpz.postMessage({ url: String(url), media: true });
+        } catch (e) {}
+        try {
+          window.__bpzMedia = window.__bpzMedia || [];
+          if (window.__bpzMedia.indexOf(String(url)) < 0) { window.__bpzMedia.push(String(url)); }
+        } catch (e) {}
+      }
+
+      function isMedia(u) {
+        var s = String(u || '');
+        // 只认播放列表和整段视频；.ts 分片不要，抓到的会是几千个分片之一
+        return /\\.m3u8(\\?|#|$)/i.test(s) || /\\.mp4(\\?|#|$)/i.test(s);
+      }
+
       function want(url) {
         var u = String(url || '');
         return u.indexOf('/v1/') >= 0 || u.indexOf('/api/') >= 0;
@@ -348,6 +466,7 @@ final class SiteEngine: NSObject, ObservableObject {
       if (of) {
         window.fetch = function (input, init) {
           var url = (typeof input === 'string') ? input : (input && input.url) || '';
+          if (isMedia(url)) { postMedia(url); }
           return of.apply(this, arguments).then(function (res) {
             try {
               if (want(url) && res && res.clone) {
@@ -362,6 +481,7 @@ final class SiteEngine: NSObject, ObservableObject {
       var oo = XMLHttpRequest.prototype.open;
       XMLHttpRequest.prototype.open = function (m, u) {
         this.__bpzUrl = u;
+        if (isMedia(u)) { postMedia(u); }
         return oo.apply(this, arguments);
       };
       var os = XMLHttpRequest.prototype.send;
@@ -396,8 +516,15 @@ extension SiteEngine: WKScriptMessageHandler, WKNavigationDelegate {
 
     func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage) {
         guard let dict = message.body as? [String: Any],
-              let url = dict["url"] as? String,
-              let text = dict["body"] as? String,
+              let url = dict["url"] as? String else { return }
+
+        // 媒体地址只要 URL，不解析内容
+        if dict["media"] as? Bool == true {
+            recordMedia(url)
+            return
+        }
+
+        guard let text = dict["body"] as? String,
               let data = text.data(using: .utf8) else { return }
         guard let json = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
         else { return }
