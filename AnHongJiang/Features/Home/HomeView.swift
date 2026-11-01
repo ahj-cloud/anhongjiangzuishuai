@@ -50,7 +50,7 @@ struct HomeView: View {
                 }
             }
             .background(Theme.bg.ignoresSafeArea())
-            .navigationTitle("安洪江最帅")
+            .navigationTitle("安宇最帅")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
