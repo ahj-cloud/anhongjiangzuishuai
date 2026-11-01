@@ -41,6 +41,8 @@ struct DetailView: View {
     @State private var expanded = false
     @State private var playing: PlaybackRequest?
     @State private var showWeb = false
+    /// 正在解析播放地址（打开播放页截 m3u8，1~6 秒）
+    @State private var resolving = false
     @EnvironmentObject private var library: LibraryStore
 
     init(item: MediaItem) {
@@ -77,6 +79,28 @@ struct DetailView: View {
         .sheet(isPresented: $showWeb) {
             WebFallbackView(path: item.detailRoute)
         }
+        .overlay {
+            if resolving { resolvingOverlay }
+        }
+    }
+
+    private var resolvingOverlay: some View {
+        ZStack {
+            Color.black.opacity(0.55).ignoresSafeArea()
+            VStack(spacing: 12) {
+                ProgressView().tint(Theme.brand).scaleEffect(1.1)
+                Text("正在解析播放地址")
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundStyle(Theme.text)
+                Text("取片源直链，通常 1~5 秒")
+                    .font(.system(size: 12))
+                    .foregroundStyle(Theme.subtext)
+            }
+            .padding(.horizontal, 28)
+            .padding(.vertical, 22)
+            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
+        }
+        .transition(.opacity)
     }
 
     // MARK: 头部
@@ -278,19 +302,45 @@ struct DetailView: View {
     // MARK: 播放
 
     private func play(_ payload: DetailPayload, episode: Episode?, source: PlaybackSource?) {
-        var url: String? = episode?.url ?? source?.url
-        if url == nil { url = payload.sources.first?.url }
-
         library.markWatched(payload.item, episode: episode?.name)
 
-        // 站点片源没有直链（要先换 token 再由播放器向 provider 取分片），
-        // 所以拿不到直链时不退出 App，改为整屏内嵌站点播放页。
+        var direct: String? = episode?.url ?? source?.url
+        if direct == nil { direct = payload.sources.first?.url }
+
+        if let d = direct, !d.isEmpty {
+            start(d, payload, episode)
+            return
+        }
+
+        // 站点不返回直链：去播放页把 hls.js 请求的 m3u8 截下来，再交给原生播放器
         let path = episode?.route.flatMap { $0.isEmpty ? nil : $0 } ?? payload.item.detailRoute
+        let key = "\(payload.item.id)|\(episode?.name ?? "-")"
+        resolving = true
+        Task { @MainActor in
+            let stream = await SiteEngine.shared.resolveStream(path: path, cacheKey: key)
+            resolving = false
+            if let stream, !stream.isEmpty {
+                start(stream, payload, episode)
+            } else {
+                // 实在截不到（片源用第三方 iframe），退回整屏内嵌，仍然不出 App
+                playing = PlaybackRequest(
+                    title: payload.item.title,
+                    episode: episode?.name,
+                    url: "",
+                    webPath: path,
+                    sources: payload.sources,
+                    detail: payload.item
+                )
+            }
+        }
+    }
+
+    private func start(_ url: String, _ payload: DetailPayload, _ episode: Episode?) {
         playing = PlaybackRequest(
             title: payload.item.title,
             episode: episode?.name,
-            url: url ?? "",
-            webPath: path,
+            url: url,
+            webPath: nil,
             sources: payload.sources,
             detail: payload.item
         )
