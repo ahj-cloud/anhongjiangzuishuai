@@ -43,6 +43,8 @@ struct DetailView: View {
     @State private var showWeb = false
     /// 正在解析播放地址（打开播放页截 m3u8，1~6 秒）
     @State private var resolving = false
+    /// 后台预取只跑一次，避免反复占用隐藏 WebView
+    @State private var prefetched = false
     @EnvironmentObject private var library: LibraryStore
 
     init(item: MediaItem) {
@@ -72,7 +74,10 @@ struct DetailView: View {
         .navigationTitle(item.title)
         .navigationBarTitleDisplayMode(.inline)
         .safeAreaInset(edge: .bottom) { bottomBar }
-        .task { await vm.load() }
+        .task {
+            await vm.load()
+            await prefetchFirstStream()
+        }
         .fullScreenCover(item: $playing) { req in
             PlayerScreen(request: req)
         }
@@ -300,6 +305,28 @@ struct DetailView: View {
     }
 
     // MARK: 播放
+
+    /// 后台预取默认集的 m3u8。
+    ///
+    /// 解析要开隐藏 WebView 走一遍站点播放页，1~6 秒。用户进详情页先看简介，
+    /// 这段时间正好够跑完；点播放时 `resolveStream` 命中缓存直接返回，进播放器是秒开。
+    /// 延迟 1.5s 再启动，避免和海报图加载抢带宽。
+    private func prefetchFirstStream() async {
+        guard !prefetched, case .loaded(let payload) = vm.state else { return }
+        prefetched = true
+
+        try? await Task.sleep(nanoseconds: 1_500_000_000)
+        guard playing == nil else { return }          // 用户已经点了播放，交给 play() 走
+
+        let episode = payload.episodes.first
+        // 已带直链就不用截流
+        if let u = episode?.url, !u.isEmpty { return }
+        if payload.sources.contains(where: { !$0.url.isEmpty }) { return }
+
+        let path = episode?.route.flatMap { $0.isEmpty ? nil : $0 } ?? payload.item.detailRoute
+        let key = "\(payload.item.id)|\(episode?.name ?? "-")"
+        _ = await SiteEngine.shared.resolveStream(path: path, cacheKey: key, timeout: 12)
+    }
 
     private func play(_ payload: DetailPayload, episode: Episode?, source: PlaybackSource?) {
         library.markWatched(payload.item, episode: episode?.name)
