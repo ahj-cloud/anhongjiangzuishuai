@@ -6,7 +6,10 @@ struct PlaybackRequest: Identifiable {
     let id = UUID()
     var title: String
     var episode: String?
+    /// 直链（m3u8/mp4）。站点大多数片源拿不到，为空时走 webPath 内嵌播放。
     var url: String
+    /// 站点播放页路径，形如 /player/av_xxx。非空且 url 为空时用全屏 WebView 播放。
+    var webPath: String?
     var sources: [PlaybackSource]
     var detail: MediaItem
 }
