@@ -35,11 +35,29 @@ struct PlayerScreen: View {
                     Image(systemName: "exclamationmark.triangle")
                         .font(.system(size: 30)).foregroundStyle(.white.opacity(0.8))
                     Text(err).font(.footnote).foregroundStyle(.white.opacity(0.7))
-                    Button("用网页播放") { dismiss() }
-                        .font(.footnote.weight(.semibold))
-                        .padding(.horizontal, 18).padding(.vertical, 8)
-                        .background(Theme.brand, in: Capsule()).foregroundStyle(.white)
+                        .multilineTextAlignment(.center)
+                    HStack(spacing: 12) {
+                        Button("重试") { pc.load(url: request.url) }
+                            .font(.footnote.weight(.semibold))
+                            .padding(.horizontal, 18).padding(.vertical, 8)
+                            .background(Theme.brand, in: Capsule()).foregroundStyle(.white)
+                        Button("返回") { dismiss() }
+                            .font(.footnote.weight(.semibold))
+                            .padding(.horizontal, 18).padding(.vertical, 8)
+                            .background(Color.white.opacity(0.14), in: Capsule()).foregroundStyle(.white)
+                    }
                 }
+                .padding(.horizontal, 24)
+            } else if pc.reconnecting {
+                // 断流重连时只给一条轻提示，画面留在最后一帧，不打断
+                HStack(spacing: 8) {
+                    ProgressView().tint(.white).scaleEffect(0.8)
+                    Text("网络波动，正在重连")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.85))
+                }
+                .padding(.horizontal, 14).padding(.vertical, 8)
+                .background(.black.opacity(0.45), in: Capsule())
             }
 
             if chrome {
