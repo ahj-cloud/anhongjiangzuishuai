@@ -5,8 +5,11 @@ final class SearchViewModel: ObservableObject {
     @Published private(set) var state: LoadState<[MediaItem]> = .idle
     @Published var keyword = ""
     @Published private(set) var searching = false
+    /// 已有本地结果、远端还在补全时置 true（结果区顶部显示一条细进度条，不遮挡列表）
+    @Published private(set) var refining = false
 
     private let historyKey = "bpz.search.history"
+    private var seq = 0          // 请求序号，防止先发后到覆盖新结果
 
     var recent: [String] {
         UserDefaults.standard.stringArray(forKey: historyKey) ?? []
@@ -16,16 +19,38 @@ final class SearchViewModel: ObservableObject {
         let q = (text ?? keyword).trimmingCharacters(in: .whitespacesAndNewlines)
         guard !q.isEmpty else { return }
         keyword = q
-        searching = true
-        state = .loading
-        defer { searching = false }
 
+        seq += 1
+        let mySeq = seq
+
+        // 第一层：本地片库匹配，立刻出结果，不用等网络
+        let local = SiteEngine.shared.localSearch(q)
+        if !local.isEmpty {
+            state = .loaded(local)
+            refining = true
+            searching = true
+        } else {
+            state = .loading
+            searching = true
+            refining = false
+        }
+
+        // 第二层：远端完整搜索（AI 会话，3~8 秒），回来后覆盖
         do {
             let items = try await SiteEngine.shared.search(q)
+            guard mySeq == seq else { return }        // 已发起新搜索，丢弃旧结果
             state = .loaded(items)
             remember(q)
         } catch {
-            state = .failed((error as? LocalizedError)?.errorDescription ?? "搜索失败")
+            guard mySeq == seq else { return }
+            if local.isEmpty {
+                state = .failed((error as? LocalizedError)?.errorDescription ?? "搜索失败")
+            }
+            // 本地已有结果就保留，不弹错误
+        }
+        if mySeq == seq {
+            searching = false
+            refining = false
         }
     }
 
@@ -54,7 +79,7 @@ struct SearchView: View {
                 case .idle:
                     suggestions
                 case .loading:
-                    LoadingView(text: "正在搜索")
+                    LoadingView(text: "AI 正在检索，请稍候")
                 case .failed(let msg):
                     VStack(spacing: 16) {
                         ErrorStateView(message: msg)
@@ -104,13 +129,24 @@ struct SearchView: View {
 
     private func results(_ items: [MediaItem]) -> some View {
         ScrollView {
-            LazyVGrid(columns: columns, spacing: 16) {
-                ForEach(items) { item in
-                    NavigationLink(value: item) { PosterCard(item: item, width: 104) }
-                        .buttonStyle(.plain)
+            VStack(spacing: 0) {
+                // 远端还在补全时显示一条细进度条，不遮挡已有结果
+                if vm.refining {
+                    ProgressView()
+                        .progressViewStyle(.linear)
+                        .tint(Theme.brand)
+                        .frame(height: 2)
+                        .padding(.horizontal, Theme.pagePadding)
+                        .padding(.top, 6)
                 }
+                LazyVGrid(columns: columns, spacing: 16) {
+                    ForEach(items) { item in
+                        NavigationLink(value: item) { PosterCard(item: item, width: 104) }
+                            .buttonStyle(.plain)
+                    }
+                }
+                .padding(Theme.pagePadding)
             }
-            .padding(Theme.pagePadding)
         }
     }
 }
