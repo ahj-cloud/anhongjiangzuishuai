@@ -92,7 +92,7 @@ struct SearchView: View {
                 case .failed(let msg):
                     VStack(spacing: 16) {
                         ErrorStateView(message: msg)
-                        Button("在网页里搜") { showWeb = true }
+                        Button("在站点里直接搜") { showWeb = true }
                             .font(.footnote.weight(.semibold))
                             .foregroundStyle(Theme.brand)
                     }
@@ -111,7 +111,10 @@ struct SearchView: View {
             }
             .navigationDestination(for: MediaItem.self) { DetailView(item: $0) }
             .sheet(isPresented: $showWeb) {
-                WebFallbackView(path: "/search?q=\(vm.keyword.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? "")")
+                // 站点没有 /search 路由，真实的搜索是 AI 会话入口；
+                // 走 /search?q= 只会拿到首页，看起来像“搜了个寂寞”
+                let q = vm.keyword.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
+                WebFallbackView(path: "/session/new?pending=1&submission=\(q)")
             }
         }
     }
@@ -187,7 +190,7 @@ struct SearchView: View {
                     }
                 }
                 Text("热门搜索").font(.system(size: 15, weight: .semibold))
-                FlowTags(items: ["玩具总动员", "牧神记", "仙逆", "年会不能停", "现在就出发"], onTap: { q in
+                FlowTags(items: ["现在就出发 第四季", "现在就出发", "玩具总动员", "牧神记", "仙逆", "年会不能停"], onTap: { q in
                     Task { await vm.search(q) }
                 })
             }
