@@ -249,15 +249,17 @@ struct DetailView: View {
     private func play(_ payload: DetailPayload, episode: Episode?, source: PlaybackSource?) {
         var url: String? = episode?.url ?? source?.url
         if url == nil { url = payload.sources.first?.url }
-        guard let finalURL = url else {
-            showWeb = true                     // 拿不到直链就交给网页播放器
-            return
-        }
+
         library.markWatched(payload.item, episode: episode?.name)
+
+        // 站点片源没有直链（要先换 token 再由播放器向 provider 取分片），
+        // 所以拿不到直链时不退出 App，改为整屏内嵌站点播放页。
+        let path = episode?.route.flatMap { $0.isEmpty ? nil : $0 } ?? payload.item.detailRoute
         playing = PlaybackRequest(
             title: payload.item.title,
             episode: episode?.name,
-            url: finalURL,
+            url: url ?? "",
+            webPath: path,
             sources: payload.sources,
             detail: payload.item
         )
