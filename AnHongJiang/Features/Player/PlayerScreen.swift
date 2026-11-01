@@ -15,6 +15,15 @@ struct PlayerScreen: View {
     @EnvironmentObject private var library: LibraryStore
 
     var body: some View {
+        // 站点片源多数拿不到直链，此时整屏交给内嵌播放器，不再退回浏览器
+        if request.url.isEmpty, let path = request.webPath {
+            WebPlayerScreen(path: path, title: request.title, episode: request.episode)
+        } else {
+            nativePlayer
+        }
+    }
+
+    private var nativePlayer: some View {
         ZStack {
             Color.black.ignoresSafeArea()
 
