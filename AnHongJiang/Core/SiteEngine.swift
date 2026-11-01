@@ -55,11 +55,37 @@ final class SiteEngine: NSObject, ObservableObject {
             let feed = try await task.value
             lastHome = feed
             homeTask = nil
+            // 把首页所有条目沉成一份本地语料，搜索时先做本地过滤，避免每次都干等远端
+            var seen = Set<String>()
+            corpus = (feed.hero + feed.sections.flatMap { $0.items }).filter {
+                seen.insert($0.id).inserted
+            }
             return feed
         } catch {
             homeTask = nil
             throw error
         }
+    }
+
+    /// 本地语料库：首页已加载的全部条目，用于搜索时即时出结果
+    private var corpus: [MediaItem] = []
+
+    /// 先在本地片库里模糊匹配，命中即为「秒出」结果；远端结果回来后覆盖。
+    func localSearch(_ word: String, limit: Int = 40) -> [MediaItem] {
+        let w = word.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !w.isEmpty else { return [] }
+        var exact: [MediaItem] = []
+        var fuzzy: [MediaItem] = []
+        for item in corpus {
+            let title = item.title.lowercased()
+            if title.contains(w) {
+                exact.append(item)
+            } else if let sum = item.summary?.lowercased(), sum.contains(w) {
+                fuzzy.append(item)
+            }
+        }
+        // 标题命中的排前面，简介命中的补后面
+        return Array((exact + fuzzy).prefix(limit))
     }
 
     func browse(path: String) async throws -> [MediaItem] {
@@ -69,17 +95,41 @@ final class SiteEngine: NSObject, ObservableObject {
         return items
     }
 
+    /// 搜索结果缓存。AI 会话链路单次要 3~8 秒，同词重复搜必须命中缓存。
+    private var searchCache: [String: (items: [MediaItem], at: Date)] = [:]
+    private let searchCacheTTL: TimeInterval = 300      // 5 分钟
+    private let searchCacheLimit = 40
+
     func search(_ keyword: String) async throws -> [MediaItem] {
-        let q = keyword.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? keyword
-        // 搜索参数名不确定，按常见写法依次尝试，命中即返回
-        for param in ["q", "keyword", "wd", "search"] {
-            guard let bodies = try? await visit(path: "/search?\(param)=\(q)", timeout: 12,
-                                                match: { $0.contains("/v1/") || $0.lowercased().contains("search") })
-            else { continue }
-            let items = FeedParser.items(from: merge(bodies))
-            if !items.isEmpty { return items }
+        let word = keyword.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !word.isEmpty else { throw SiteError.empty("关键词为空") }
+
+        if let hit = searchCache[word], Date().timeIntervalSince(hit.at) < searchCacheTTL {
+            return hit.items
         }
-        throw SiteError.empty("没有搜到「\(keyword)」")
+
+        // 站点真实搜索路由：/session/new?pending=1&submission=<q>
+        // （路由表里没有 /search，按 /search?q= 请求只会 404 后空等超时）
+        let q = word.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? word
+        let path = "/session/new?pending=1&submission=\(q)"
+
+        let bodies = try await visit(path: path, timeout: 30,
+                                     match: { url in
+                                         url.contains("/v1/") || url.contains("/session")
+                                     },
+                                     settle: 4)
+        let items = FeedParser.items(from: merge(bodies))
+        guard !items.isEmpty else { throw SiteError.empty("没有搜到「\(word)」") }
+
+        searchCache[word] = (items, Date())
+        if searchCache.count > searchCacheLimit {
+            // 超限时按时间淘汰最旧的一批
+            let sorted = searchCache.sorted { $0.value.at < $1.value.at }
+            for (k, _) in sorted.prefix(searchCache.count - searchCacheLimit) {
+                searchCache.removeValue(forKey: k)
+            }
+        }
+        return items
     }
 
     func detail(_ item: MediaItem) async throws -> DetailPayload {
@@ -132,34 +182,97 @@ final class SiteEngine: NSObject, ObservableObject {
 
     // MARK: - 导航 + 抓包
 
+    /// 导航到指定路径并收集 `/v1/*` 响应体。
+    ///
+    /// 优先走站内软跳转（history.pushState + popstate），SPA 已加载时省掉 1~3 秒的整页重载；
+    /// 软跳转 3 秒内没数据再退回整页 load 兜底。
+    /// settle 表示「连续多少次采样没有新增数据就认为收齐」，替代原先固定的 900ms 盲等。
     private func visit(path: String, timeout: TimeInterval,
-                       match: @escaping (String) -> Bool) async throws -> [Any] {
+                       match: @escaping (String) -> Bool,
+                       settle: Int = 3) async throws -> [Any] {
         let start = Date()
         let url = SiteConfig.url(path)
-        await MainActor.run {
-            self.lastError = nil
-            self.webView.stopLoading()
-            var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData,
-                                 timeoutInterval: timeout)
-            req.setValue(SiteConfig.userAgent, forHTTPHeaderField: "User-Agent")
-            self.webView.load(req)
+
+        let soft = await softNavigate(path)
+        if !soft {
+            await hardLoad(url, timeout: timeout)
         }
 
-        let deadline = Date().addingTimeInterval(timeout)
-        var hit: [Capture] = []
-        while Date() < deadline {
-            hit = snapshotCaptures(since: start, match: match)
-            if !hit.isEmpty { break }
-            try? await Task.sleep(nanoseconds: 120_000_000)
+        // 软跳转窗口：AI 搜索会话首个响应常在 3~5 秒，给 8 秒；给太短会误判成路由失效
+        let softWindow = min(timeout, 8)
+        var hit = await waitForCapture(since: start, match: match,
+                                       deadline: Date().addingTimeInterval(soft ? softWindow : timeout))
+
+        if hit.isEmpty && soft {
+            // 软跳转没触发路由（站点可能自定义了导航），退回整页加载
+            await hardLoad(url, timeout: timeout)
+            hit = await waitForCapture(since: start, match: match,
+                                       deadline: Date().addingTimeInterval(timeout))
         }
+
         guard !hit.isEmpty else {
             await MainActor.run { self.lastError = "页面数据没有返回" }
             throw SiteError.timeout
         }
-        // 首个响应之后通常还有详情/播放地址等后续请求，多等一会儿收齐
-        try? await Task.sleep(nanoseconds: 900_000_000)
-        hit = snapshotCaptures(since: start, match: match)
+
+        // 流式接口（AI 搜索会话）：等数据不再增长，而不是固定睡死
+        var lastCount = hit.count
+        var idle = 0
+        let cap = Date().addingTimeInterval(8)
+        while idle < settle && Date() < cap {
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            hit = snapshotCaptures(since: start, match: match)
+            if hit.count == lastCount { idle += 1 } else { idle = 0; lastCount = hit.count }
+        }
         return hit.map { $0.body }
+    }
+
+    private func hardLoad(_ url: URL, timeout: TimeInterval) async {
+        await MainActor.run {
+            self.lastError = nil
+            self.webView.stopLoading()
+            var req = URLRequest(url: url, timeoutInterval: timeout)
+            req.setValue(SiteConfig.userAgent, forHTTPHeaderField: "User-Agent")
+            self.webView.load(req)
+        }
+    }
+
+    private func waitForCapture(since: Date, match: (String) -> Bool,
+                                deadline: Date) async -> [Capture] {
+        var hit: [Capture] = []
+        while Date() < deadline {
+            hit = snapshotCaptures(since: since, match: match)
+            if !hit.isEmpty { break }
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        return hit
+    }
+
+    /// 站内软跳转：只改路由不重载页面。返回 false 表示当前没有可用页面或站点不认。
+    private func softNavigate(_ path: String) async -> Bool {
+        guard isReady else { return false }
+        let literal = Self.jsLiteral(path)
+        let js = """
+        (function(){
+          try {
+            var p = \(literal);
+            if (!p) { return 'fail'; }
+            history.pushState({}, '', p);
+            window.dispatchEvent(new PopStateEvent('popstate', { state: {} }));
+            window.dispatchEvent(new Event('popstate'));
+            return 'pushed';
+          } catch (e) { return 'fail'; }
+        })()
+        """
+        let r = try? await evaluate(js)
+        return (r as? String) == "pushed"
+    }
+
+    /// 把 Swift 字符串转成可安全嵌进 JS 的字面量
+    private static func jsLiteral(_ s: String) -> String {
+        let data = try? JSONSerialization.data(withJSONObject: [s], options: [])
+        guard let d = data, let arr = String(data: d, encoding: .utf8) else { return "\"\"" }
+        return String(arr.dropFirst().dropLast())     // 去掉外层 [ ]
     }
 
     private func snapshotCaptures(since: Date, match: (String) -> Bool) -> [Capture] {
