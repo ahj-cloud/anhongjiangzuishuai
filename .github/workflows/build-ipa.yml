@@ -5,20 +5,36 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# 连续推送时只保留最新一次，避免排队几十个构建
+concurrency:
+  group: build-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
-    runs-on: macos-14
+    # macos-14 镜像已于 2026-11-02 退役（brownout），必须用 macos-15
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
 
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          sw_vers
+
       - name: Install XcodeGen
-        run: brew install xcodegen
+        run: |
+          if ! command -v xcodegen >/dev/null 2>&1; then
+            brew install xcodegen
+          fi
+          xcodegen --version
 
       - name: Generate project
         run: xcodegen generate
 
       - name: Build unsigned app
         run: |
+          set -o pipefail
           xcodebuild \
             -project AnHongJiang.xcodeproj \
             -scheme AnHongJiang \
@@ -29,17 +45,33 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
-            build
+            build | tee build.log
 
       - name: Package ipa
+        if: success()
         run: |
+          APP=$(find build/Build/Products -maxdepth 2 -name "*.app" -type d | head -1)
+          echo "APP=$APP"
+          test -n "$APP"
           mkdir -p out/Payload
-          cp -R build/Build/Products/Release-iphoneos/AnHongJiang.app out/Payload/
+          cp -R "$APP" out/Payload/
           cd out
           zip -qry AnHongJiang-unsigned.ipa Payload
           ls -lh AnHongJiang-unsigned.ipa
+          unzip -l AnHongJiang-unsigned.ipa | head -20
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload ipa
+        if: success()
+        uses: actions/upload-artifact@v4
         with:
           name: AnHongJiang-unsigned-ipa
           path: out/AnHongJiang-unsigned.ipa
+          if-no-files-found: error
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
