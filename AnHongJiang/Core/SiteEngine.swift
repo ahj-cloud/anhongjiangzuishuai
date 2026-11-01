@@ -133,7 +133,8 @@ final class SiteEngine: NSObject, ObservableObject {
     }
 
     func detail(_ item: MediaItem) async throws -> DetailPayload {
-        let bodies = try await visit(path: item.detailRoute, timeout: 20) { url in
+        // 失败会走兜底，别把用户晾太久
+        let bodies = try await visit(path: item.detailRoute, timeout: 10) { url in
             url.contains("/v1/")
         }
         let payload = FeedParser.detail(from: merge(bodies), fallback: item)
