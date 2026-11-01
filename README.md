@@ -1,4 +1,4 @@
-# 安洪江最帅（AnHongJiang）
+# 安宇最帅（AnHongJiang）
 
 bpz3.com（搜剧AI）的 iOS 原生客户端。SwiftUI 6 视图 + AVPlayer 播放器 + DLNA 投屏 + WKWebView 数据引擎。
 
