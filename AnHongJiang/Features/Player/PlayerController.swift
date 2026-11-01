@@ -123,11 +123,9 @@ final class PlayerController: ObservableObject {
 
         // 蜂窝网络限制峰值码率。AVPlayer 只会从 master playlist 里挑不超过这个值的最高档，
         // 不写死具体档位，所以 WiFi 下仍然是最高画质。
-        if isExpensiveNetwork {
-            asset.preferredPeakBitRate = 1_600_000
-        }
-
+        let peak: Double? = isExpensiveNetwork ? 1_600_000 : nil
         let item = AVPlayerItem(asset: asset)
+        if let peak { item.preferredPeakBitRate = peak }
         // 8s（默认）在弱网下起播就断粮，15s 让播放器提前囤够一个缓冲周期
         item.preferredForwardBufferDuration = 15
         // 暂停时也继续拉分片，恢复播放不用重新等
