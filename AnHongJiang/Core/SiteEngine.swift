@@ -417,23 +417,34 @@ final class SiteEngine: NSObject, ObservableObject {
 
         // 预取和用户点播会同时触发解析，去重：同一个 key 只跑一次。
         // 否则隐藏 WebView 会被两次导航互相打乱，谁都不出结果。
-        lock.lock()
-        if let running = streamTasks[key] {
-            lock.unlock()
+        if let running = streamTask(for: key) {
             return await running.value
         }
         let task = Task<String?, Never> { [weak self] in
             guard let self else { return nil }
             return await self.doResolveStream(path: path, key: key, timeout: timeout)
         }
-        streamTasks[key] = task
-        lock.unlock()
+        setStreamTask(task, for: key)
 
         let result = await task.value
-        lock.lock()
-        streamTasks.removeValue(forKey: key)
-        lock.unlock()
+        clearStreamTask(for: key)
         return result
+    }
+
+    // 锁只在同步函数里取，避免 NSLock 在 async 上下文中的可用性告警
+    private func streamTask(for key: String) -> Task<String?, Never>? {
+        lock.lock(); defer { lock.unlock() }
+        return streamTasks[key]
+    }
+
+    private func setStreamTask(_ t: Task<String?, Never>, for key: String) {
+        lock.lock(); defer { lock.unlock() }
+        streamTasks[key] = t
+    }
+
+    private func clearStreamTask(for key: String) {
+        lock.lock(); defer { lock.unlock() }
+        streamTasks[key] = nil
     }
 
     private func doResolveStream(path: String, key: String,
